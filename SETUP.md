@@ -54,7 +54,26 @@ FITBIT_REFRESH_TOKEN="x8z..."
 ```
 
 ## 6. Run
-The skill is now ready. The script will automatically refresh the token when it expires.
+The skill is now ready. The client refreshes access tokens proactively before expiry and rewrites persisted tokens atomically after a successful rotation.
 ```bash
 python scripts/fitbit_api.py report --type weekly
 ```
+
+## 7. Keep Refresh Tokens Active
+Run the standalone refresh command every 6 hours so Fitbit refresh token rotation stays ahead of inactivity expiry:
+
+```bash
+python scripts/refresh_tokens.py
+```
+
+Example cron entry:
+
+```bash
+0 */6 * * * cd /path/to/fitbit-analytics-openclaw-skill && python3 scripts/refresh_tokens.py
+```
+
+The local cache file `~/.fitbit-analytics/tokens.json` now stores:
+- `access_token`
+- `refresh_token`
+- `expires_at`
+- `refreshed_at`

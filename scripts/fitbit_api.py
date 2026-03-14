@@ -14,16 +14,30 @@ import sys
 import json
 import argparse
 import base64
+import fcntl
+import hashlib
 import stat
+import tempfile
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
+from contextlib import contextmanager
 
 SKILL_DIR = Path(__file__).parent.parent
 SECRETS_PATH = Path.home() / ".config" / "systemd" / "user" / "secrets.conf"
 TOKEN_CACHE_PATH = Path.home() / ".fitbit-analytics" / "tokens.json"
+TOKEN_LOCK_PATH = Path.home() / ".fitbit-analytics" / "tokens.lock"
+
+
+class FitbitAuthError(RuntimeError):
+    """Base error for Fitbit authentication failures."""
+
+
+class FitbitReauthRequiredError(FitbitAuthError):
+    """Raised when Fitbit requires a new OAuth authorization flow."""
 
 
 class FitbitClient:
@@ -31,14 +45,19 @@ class FitbitClient:
 
     BASE_URL = "https://api.fitbit.com"
     TOKEN_REFRESH_THRESHOLD_HOURS = 1  # Refresh if expires within 1 hour
+    REFRESH_MAX_AGE_HOURS = 6
+    REFRESH_RETRY_DELAYS_SECONDS = (1, 2, 4)
 
     def __init__(self, client_id=None, client_secret=None, access_token=None, refresh_token=None):
         self.client_id = client_id or self._load_env_from_secrets("FITBIT_CLIENT_ID")
         self.client_secret = client_secret or self._load_env_from_secrets("FITBIT_CLIENT_SECRET")
+        self._explicit_access_token = access_token is not None
+        self._explicit_refresh_token = refresh_token is not None
         self._access_token = access_token or self._load_env_from_secrets("FITBIT_ACCESS_TOKEN")
         self._refresh_token = refresh_token or self._load_env_from_secrets("FITBIT_REFRESH_TOKEN")
         self._token_expires_at = None
-        self._load_token_expiry()
+        self._token_refreshed_at = None
+        self._load_token_metadata()
 
         if not self._access_token:
             raise ValueError("FITBIT_ACCESS_TOKEN not set. Get tokens via OAuth flow.")
@@ -58,21 +77,48 @@ class FitbitClient:
                     return line.split('=', 1)[1].strip().strip('"')
         return None
 
-    def _load_token_expiry(self):
-        """Load token expiry from cache file or JWT decode"""
-        if TOKEN_CACHE_PATH.exists():
-            try:
-                data = json.loads(TOKEN_CACHE_PATH.read_text())
-                expires_at = data.get("expires_at")
-                if expires_at:
-                    self._token_expires_at = datetime.fromisoformat(expires_at)
-                    return
-            except (json.JSONDecodeError, KeyError):
-                pass
+    def _load_token_metadata(self):
+        """Load token metadata from cache file or JWT decode."""
+        self._load_cached_tokens()
 
-        # Fallback: decode from JWT
-        if self._access_token:
+        if not self._token_expires_at and self._access_token:
             self._decode_jwt_expiry()
+
+    def _load_cached_tokens(self, allow_override=False):
+        """Load the latest persisted tokens and timestamps from cache."""
+        if not TOKEN_CACHE_PATH.exists():
+            return False
+
+        try:
+            data = json.loads(TOKEN_CACHE_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return False
+
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        expires_at = data.get("expires_at")
+        refreshed_at = data.get("refreshed_at")
+
+        if access_token and (allow_override or not self._explicit_access_token):
+            self._access_token = access_token
+        if refresh_token and (allow_override or not self._explicit_refresh_token):
+            self._refresh_token = refresh_token
+        if expires_at:
+            try:
+                self._token_expires_at = datetime.fromisoformat(expires_at)
+            except ValueError:
+                self._token_expires_at = None
+        if refreshed_at:
+            try:
+                self._token_refreshed_at = datetime.fromisoformat(refreshed_at)
+            except ValueError:
+                self._token_refreshed_at = None
+        if self._access_token:
+            self.headers = {
+                "Authorization": f"Bearer {self._access_token}",
+                "Content-Type": "application/json"
+            }
+        return True
 
     def _decode_jwt_expiry(self):
         """Decode access token JWT to get expiry timestamp"""
@@ -95,11 +141,82 @@ class FitbitClient:
         threshold = datetime.now() + timedelta(hours=self.TOKEN_REFRESH_THRESHOLD_HOURS)
         return self._token_expires_at < threshold
 
+    def _is_refresh_age_exceeded(self, max_age_hours):
+        """Check if refresh token rotation age exceeds the desired max age."""
+        if not self._token_refreshed_at:
+            return True
+        age_limit = datetime.now() - timedelta(hours=max_age_hours)
+        return self._token_refreshed_at < age_limit
+
+    def _should_refresh_for_rotation(self, max_age_hours):
+        """Check if token refresh is due for expiry or rotation age."""
+        return self._should_refresh() or self._is_refresh_age_exceeded(max_age_hours)
+
+    @contextmanager
+    def _token_lock(self):
+        """Serialize token refresh and persistence across processes."""
+        TOKEN_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with TOKEN_LOCK_PATH.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _atomic_write_text(self, path, content):
+        """Write file contents atomically with secure permissions."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temp_path, stat.S_IRUSR | stat.S_IWUSR)
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def _upsert_secret(self, content, key, value):
+        """Insert or replace a quoted env assignment without regex substitution."""
+        assignment = f'{key}="{value}"'
+        lines = content.splitlines()
+        for index, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[index] = assignment
+                break
+        else:
+            lines.append(assignment)
+
+        updated = "\n".join(lines)
+        if content.endswith("\n") or not content:
+            updated += "\n"
+        return updated
+
+    def _mask_token(self, value):
+        """Return a short fingerprint for audit logs without exposing secrets."""
+        if not value:
+            return "missing"
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+    def _log_token_rotation(self):
+        """Write a masked audit message for successful token rotation."""
+        refreshed_at = self._token_refreshed_at.isoformat() if self._token_refreshed_at else "unknown"
+        access_fingerprint = self._mask_token(self._access_token)
+        refresh_fingerprint = self._mask_token(self._refresh_token)
+        print(
+            f"Rotated Fitbit tokens at {refreshed_at} "
+            f"(access={access_fingerprint}, refresh={refresh_fingerprint})",
+            file=sys.stderr,
+        )
+
     def _save_tokens(self, access_token, refresh_token, expires_in):
         """Save tokens to secrets.conf and cache file"""
         self._access_token = access_token
         self._refresh_token = refresh_token
-        self._token_expires_at = datetime.now() + timedelta(seconds=expires_in)
+        self._token_refreshed_at = datetime.now()
+        self._token_expires_at = self._token_refreshed_at + timedelta(seconds=expires_in)
 
         # Update secrets.conf
         if SECRETS_PATH.exists():
@@ -109,26 +226,109 @@ class FitbitClient:
                 "FITBIT_REFRESH_TOKEN": refresh_token
             }
             for key, value in updates.items():
-                if f'{key}="' in content:
-                    import re
-                    pattern = rf'({key}=")([^"]*)(")'
-                    content = re.sub(pattern, rf'\1{value}\3', content)
-                else:
-                    content += f'\n{key}="{value}"'
-            SECRETS_PATH.write_text(content)
-            os.chmod(str(SECRETS_PATH), stat.S_IRUSR | stat.S_IWUSR)
+                content = self._upsert_secret(content, key, value)
+            self._atomic_write_text(SECRETS_PATH, content)
 
         # Save to cache file
-        TOKEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        TOKEN_CACHE_PATH.write_text(json.dumps({
+        cache_payload = json.dumps({
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "expires_at": self._token_expires_at.isoformat()
-        }, indent=2))
-        os.chmod(str(TOKEN_CACHE_PATH), stat.S_IRUSR | stat.S_IWUSR)
+            "expires_at": self._token_expires_at.isoformat(),
+            "refreshed_at": self._token_refreshed_at.isoformat()
+        }, indent=2)
+        self._atomic_write_text(TOKEN_CACHE_PATH, cache_payload)
+        self.headers["Authorization"] = f"Bearer {self._access_token}"
 
-    def _request(self, endpoint, date_type="date"):
+    def _parse_http_error(self, error):
+        """Extract Fitbit error type and message from an HTTPError body."""
+        try:
+            payload = error.read().decode("utf-8")
+        except Exception:
+            return None, None
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return None, payload or None
+
+        errors = data.get("errors")
+        if isinstance(errors, list) and errors:
+            error_item = errors[0]
+            return error_item.get("errorType"), error_item.get("message")
+        return None, payload or None
+
+    def refresh_access_token(self, force=False, max_age_hours=None):
+        """Refresh access token when due or when forced."""
+        with self._token_lock():
+            self._load_cached_tokens(allow_override=True)
+
+            if not force:
+                if max_age_hours is None:
+                    if not self._should_refresh():
+                        return False
+                elif not self._should_refresh_for_rotation(max_age_hours):
+                    return False
+
+            if not self.client_id or not self.client_secret or not self._refresh_token:
+                raise FitbitAuthError("Fitbit credentials or refresh token are missing.")
+
+            auth_b64 = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
+            data = urllib.parse.urlencode({
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token
+            }).encode()
+
+            req = urllib.request.Request(
+                "https://api.fitbit.com/oauth2/token",
+                data=data,
+                headers={
+                    "Authorization": f"Basic {auth_b64}",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                method="POST"
+            )
+
+            for attempt, delay in enumerate(self.REFRESH_RETRY_DELAYS_SECONDS, start=1):
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        tokens = json.loads(resp.read().decode("utf-8"))
+                    access_token = tokens.get("access_token")
+                    refresh_token = tokens.get("refresh_token")
+                    expires_in = tokens.get("expires_in", 28800)
+                    if not access_token or not refresh_token:
+                        raise FitbitAuthError("Fitbit refresh response did not include rotated tokens.")
+
+                    self._save_tokens(access_token, refresh_token, expires_in)
+                    self._log_token_rotation()
+                    return True
+                except urllib.error.HTTPError as error:
+                    error_type, error_message = self._parse_http_error(error)
+                    if error.code == 400 and error_type == "invalid_grant":
+                        raise FitbitReauthRequiredError(
+                            "Fitbit refresh token is invalid; re-authorization is required."
+                        ) from error
+                    if error.code in (429, 500, 502, 503, 504) and attempt < len(self.REFRESH_RETRY_DELAYS_SECONDS):
+                        time.sleep(delay)
+                        continue
+                    detail = error_message or error.reason
+                    raise FitbitAuthError(
+                        f"Fitbit token refresh failed: HTTP {error.code} {detail}"
+                    ) from error
+                except urllib.error.URLError as error:
+                    if attempt < len(self.REFRESH_RETRY_DELAYS_SECONDS):
+                        time.sleep(delay)
+                        continue
+                    raise FitbitAuthError(
+                        f"Fitbit token refresh failed after retries: {error.reason}"
+                    ) from error
+
+            raise FitbitAuthError("Fitbit token refresh failed after retries.")
+
+    def _request(self, endpoint, date_type="date", allow_retry=True):
         """Make API request with auto-refresh"""
+        if self._should_refresh():
+            self.refresh_access_token()
+
         url = f"{self.BASE_URL}/{endpoint}"
         req = urllib.request.Request(url, headers=self.headers)
 
@@ -136,45 +336,10 @@ class FitbitClient:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            if e.code == 401 and self._should_refresh():
-                if self._refresh_access_token():
-                    return self._request(endpoint, date_type)
+            if e.code == 401 and allow_retry:
+                self.refresh_access_token(force=True)
+                return self._request(endpoint, date_type, allow_retry=False)
             raise
-
-    def _refresh_access_token(self):
-        """Refresh access token and persist"""
-        if not self.client_id or not self.client_secret or not self._refresh_token:
-            return False
-
-        auth_b64 = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
-        data = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": self._refresh_token
-        }).encode()
-
-        req = urllib.request.Request(
-            "https://api.fitbit.com/oauth2/token",
-            data=data,
-            headers={
-                "Authorization": f"Basic {auth_b64}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
-            method="POST"
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                tokens = json.loads(resp.read().decode("utf-8"))
-                access_token = tokens.get("access_token")
-                refresh_token = tokens.get("refresh_token")
-                expires_in = tokens.get("expires_in", 28800)
-
-                self._save_tokens(access_token, refresh_token, expires_in)
-                self.headers["Authorization"] = f"Bearer {self._access_token}"
-                return True
-        except urllib.error.HTTPError as e:
-            print(f"Token refresh failed: {e.code} {e.reason}", file=sys.stderr)
-            return False
 
     def get_steps(self, start_date, end_date):
         """Fetch step data"""

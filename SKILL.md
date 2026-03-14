@@ -30,6 +30,9 @@ python scripts/fitbit_api.py sleep --days 7
 # Generate weekly health report
 python scripts/fitbit_api.py report --type weekly
 
+# Refresh rotated OAuth tokens when due
+python scripts/refresh_tokens.py
+
 # Get activity summary
 python scripts/fitbit_api.py summary --days 7
 ```
@@ -135,6 +138,7 @@ python {baseDir}/scripts/alerts.py --days 7 --steps 8000 --sleep 7
 ## Scripts
 
 - `scripts/fitbit_api.py` - Fitbit Web API wrapper, CLI, and analysis
+- `scripts/refresh_tokens.py` - Standalone proactive token refresh CLI
 - `scripts/fitbit_briefing.py` - Morning briefing CLI (text/brief/json output)
 - `scripts/alerts.py` - Threshold-based notifications
 
@@ -165,6 +169,7 @@ Fitbit API requires OAuth 2.0 authentication:
 2. Get client_id and client_secret
 3. Complete OAuth flow to get access_token and refresh_token
 4. Set environment variables or pass to scripts
+5. Run `python scripts/refresh_tokens.py` every 6 hours to keep refresh token rotation active
 
 ## Environment
 
@@ -193,3 +198,19 @@ openclaw cron add \
 ```
 
 **Note:** Replace `/path/to/your/` with your actual path and `<YOUR_TELEGRAM_CHAT_ID>` with your Telegram channel/group ID.
+
+### Proactive Token Refresh (Every 6 Hours)
+```bash
+openclaw cron add \
+  --name "Refresh Fitbit Tokens" \
+  --cron "0 */6 * * *" \
+  --tz "America/Los_Angeles" \
+  --session isolated \
+  --wake next-heartbeat \
+  --deliver \
+  --channel telegram \
+  --target "<YOUR_TELEGRAM_CHAT_ID>" \
+  --message "cd /path/to/your && python3 scripts/refresh_tokens.py"
+```
+
+The token cache at `~/.fitbit-analytics/tokens.json` stores `expires_at` and `refreshed_at` so the refresh command can rotate tokens before Fitbit inactivity expiry.

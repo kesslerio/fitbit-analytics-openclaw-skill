@@ -85,6 +85,15 @@ python scripts/fitbit_briefing.py --format brief
 python scripts/fitbit_briefing.py --format json
 ```
 
+### Proactive Token Refresh
+```bash
+# Refresh only when the last token rotation is older than 6 hours
+python scripts/refresh_tokens.py
+
+# Force a refresh immediately
+python scripts/refresh_tokens.py --force
+```
+
 **Example brief output:**
 ```
 📊 8,543 steps • 2,340 cal
@@ -118,10 +127,24 @@ python scripts/fitbit_briefing.py --format json
 
 ## Structure
 - `scripts/fitbit_api.py`: Main API wrapper and CLI tool.
+- `scripts/refresh_tokens.py`: Standalone proactive token refresh CLI.
 - `scripts/fitbit_briefing.py`: Morning briefing CLI (text/brief/json output).
 - `scripts/alerts.py`: Threshold-based notifications.
 - `references/`: API and metrics documentation.
 - `docs/`: Privacy Policy and Terms of Service.
+
+## Token Refresh Behavior
+- The client refreshes tokens proactively before API calls when the access token is close to expiry.
+- A 401 response still triggers one forced refresh/retry to cover stale expiry metadata or clock drift.
+- Successful refreshes update `~/.config/systemd/user/secrets.conf` when present and always rewrite `~/.fitbit-analytics/tokens.json` atomically.
+- The token cache now stores both `expires_at` and `refreshed_at` so `scripts/refresh_tokens.py` can rotate refresh tokens before Fitbit inactivity limits are hit.
+
+## Automation
+Run the standalone refresh command every 6 hours to keep the rotated refresh token active:
+
+```bash
+0 */6 * * * cd /path/to/fitbit-analytics-openclaw-skill && python3 scripts/refresh_tokens.py
+```
 
 ## License
 Apache 2.0
