@@ -143,6 +143,25 @@ class FitbitAuthTests(unittest.TestCase):
         self.assertEqual(response, {"ok": True})
         refresh_mock.assert_not_called()
 
+    def test_request_continues_when_preflight_refresh_fails(self):
+        client = self.make_client()
+        client._token_expires_at = datetime.now() + timedelta(minutes=30)
+
+        with mock.patch.object(
+            client,
+            "refresh_access_token",
+            side_effect=fitbit_api.FitbitAuthError("temporary refresh failure"),
+        ) as refresh_mock:
+            with mock.patch.object(
+                fitbit_api.urllib.request,
+                "urlopen",
+                return_value=FakeResponse({"ok": True}),
+            ):
+                response = client._request("1/user/-/profile.json")
+
+        self.assertEqual(response, {"ok": True})
+        refresh_mock.assert_called_once_with()
+
     def test_request_retries_once_on_401_with_stale_metadata(self):
         client = self.make_client()
         client._token_expires_at = datetime.now() + timedelta(hours=4)

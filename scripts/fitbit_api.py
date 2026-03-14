@@ -383,7 +383,10 @@ class FitbitClient:
     def _request(self, endpoint, date_type="date", allow_retry=True):
         """Make API request with auto-refresh"""
         if self._should_refresh() and self._can_refresh_access_token():
-            self.refresh_access_token()
+            try:
+                self.refresh_access_token()
+            except FitbitAuthError as error:
+                print(f"Fitbit preflight refresh skipped: {error}", file=sys.stderr)
 
         url = f"{self.BASE_URL}/{endpoint}"
         req = urllib.request.Request(url, headers=self.headers)
