@@ -128,6 +128,21 @@ class FitbitAuthTests(unittest.TestCase):
         self.assertEqual(events, ["refresh", "request"])
         refresh_mock.assert_called_once_with()
 
+    def test_request_skips_preflight_refresh_when_refresh_credentials_are_missing(self):
+        client = fitbit_api.FitbitClient(access_token="token_only_access")
+        client._token_expires_at = None
+
+        with mock.patch.object(client, "refresh_access_token") as refresh_mock:
+            with mock.patch.object(
+                fitbit_api.urllib.request,
+                "urlopen",
+                return_value=FakeResponse({"ok": True}),
+            ):
+                response = client._request("1/user/-/profile.json")
+
+        self.assertEqual(response, {"ok": True})
+        refresh_mock.assert_not_called()
+
     def test_request_retries_once_on_401_with_stale_metadata(self):
         client = self.make_client()
         client._token_expires_at = datetime.now() + timedelta(hours=4)

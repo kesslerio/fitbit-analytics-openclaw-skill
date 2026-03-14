@@ -203,6 +203,10 @@ class FitbitClient:
         """Check if token refresh is due for expiry or rotation age."""
         return self._should_refresh() or self._is_refresh_age_exceeded(max_age_hours)
 
+    def _can_refresh_access_token(self):
+        """Check whether refresh credentials are available."""
+        return bool(self.client_id and self.client_secret and self._refresh_token)
+
     @contextmanager
     def _token_lock(self):
         """Serialize token refresh and persistence across processes."""
@@ -321,7 +325,7 @@ class FitbitClient:
                 elif not self._should_refresh_for_rotation(max_age_hours):
                     return False
 
-            if not self.client_id or not self.client_secret or not self._refresh_token:
+            if not self._can_refresh_access_token():
                 raise FitbitAuthError("Fitbit credentials or refresh token are missing.")
 
             auth_b64 = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
@@ -378,7 +382,7 @@ class FitbitClient:
 
     def _request(self, endpoint, date_type="date", allow_retry=True):
         """Make API request with auto-refresh"""
-        if self._should_refresh():
+        if self._should_refresh() and self._can_refresh_access_token():
             self.refresh_access_token()
 
         url = f"{self.BASE_URL}/{endpoint}"
@@ -388,7 +392,7 @@ class FitbitClient:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            if e.code == 401 and allow_retry:
+            if e.code == 401 and allow_retry and self._can_refresh_access_token():
                 self.refresh_access_token(force=True)
                 return self._request(endpoint, date_type, allow_retry=False)
             raise
