@@ -5,3 +5,6 @@ venv/
 .venv/
 ENV/
 env/
+
+.ai/
+.worktrees/
