@@ -60,7 +60,9 @@ class FitbitClient:
             padding = 4 - len(payload) % 4
             if padding != 4:
                 payload += '=' * padding
-            data = json.loads(base64.b64decode(payload))
+            # Fitbit JWTs are base64url; urlsafe_b64decode accepts both alphabets
+            # (it only translates '-'/'_'), while b64decode rejects url-safe chars.
+            data = json.loads(base64.urlsafe_b64decode(payload))
             exp = data.get("exp")
             return datetime.fromtimestamp(exp) if exp else None
         except (IndexError, json.JSONDecodeError, TypeError, ValueError):
@@ -72,6 +74,13 @@ class FitbitClient:
             return
         try:
             data = json.loads(TOKEN_CACHE_PATH.read_text())
+            # A cached pair is only a rotation of the CURRENT credentials if it was
+            # written for the same Fitbit client. A cache from a previous app/account
+            # could out-live the env pair on expiry alone and hijack requests, so an
+            # unassociated or mismatched cache is never adopted (legacy caches gain
+            # a client_id on the next refresh via _save_tokens).
+            if data.get("client_id") != self.client_id:
+                return
             cached_access = data.get("access_token")
             cached_refresh = data.get("refresh_token")
             cached_expiry_raw = data.get("expires_at")
@@ -163,7 +172,8 @@ class FitbitClient:
         TOKEN_CACHE_PATH.write_text(json.dumps({
             "access_token": access_token,
             "refresh_token": refresh_token,
-            "expires_at": self._token_expires_at.isoformat()
+            "expires_at": self._token_expires_at.isoformat(),
+            "client_id": self.client_id
         }, indent=2))
         os.chmod(str(TOKEN_CACHE_PATH), stat.S_IRUSR | stat.S_IWUSR)
 
