@@ -48,16 +48,15 @@ class FitbitTokenPersistenceTests(unittest.TestCase):
             f'FITBIT_REFRESH_TOKEN="{refresh_token}"\n'
         )
 
-    def write_cache(self, access_token, refresh_token, expires_at):
-        self.cache_path.write_text(
-            json.dumps(
-                {
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "expires_at": expires_at.isoformat(),
-                }
-            )
-        )
+    def write_cache(self, access_token, refresh_token, expires_at, client_id="client"):
+        payload = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at.isoformat(),
+        }
+        if client_id is not None:
+            payload["client_id"] = client_id
+        self.cache_path.write_text(json.dumps(payload))
 
     def test_prefers_newer_rotated_cache_pair(self):
         now = datetime.now()
@@ -86,6 +85,64 @@ class FitbitTokenPersistenceTests(unittest.TestCase):
 
         self.assertEqual(client._access_token, new_access)
         self.assertEqual(client._refresh_token, "new-refresh")
+
+    def test_ignores_cache_written_for_a_different_client(self):
+        now = datetime.now()
+        env_access = jwt_with_expiry(now + timedelta(hours=1))
+        self.write_secrets(env_access, "env-refresh")
+        self.write_cache(
+            jwt_with_expiry(now + timedelta(hours=8)),
+            "other-account-refresh",
+            now + timedelta(hours=8),
+            client_id="someone-elses-app",
+        )
+
+        client = fitbit_api.FitbitClient()
+
+        self.assertEqual(client._access_token, env_access)
+        self.assertEqual(client._refresh_token, "env-refresh")
+
+    def test_ignores_legacy_cache_without_client_association(self):
+        now = datetime.now()
+        env_access = jwt_with_expiry(now + timedelta(hours=1))
+        self.write_secrets(env_access, "env-refresh")
+        self.write_cache(
+            jwt_with_expiry(now + timedelta(hours=8)),
+            "unverified-refresh",
+            now + timedelta(hours=8),
+            client_id=None,
+        )
+
+        client = fitbit_api.FitbitClient()
+
+        self.assertEqual(client._refresh_token, "env-refresh")
+
+    def test_save_tokens_stamps_client_association_on_cache(self):
+        self.write_secrets("old-access", "old-refresh")
+        client = fitbit_api.FitbitClient()
+
+        client._save_tokens("new-access", "new-refresh", 3600)
+
+        cached = json.loads(self.cache_path.read_text())
+        self.assertEqual(cached["client_id"], "client")
+
+    def test_jwt_expiry_decodes_base64url_payloads(self):
+        exp = datetime.now() + timedelta(hours=4)
+        # Find a payload whose base64url encoding uses the url-safe-only
+        # characters ('-' or '_'), which standard b64decode rejects.
+        for i in range(4096):
+            raw = json.dumps({"exp": int(exp.timestamp()), "pad": f"x{i}~\x7f"}).encode()
+            encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+            if "-" in encoded or "_" in encoded:
+                token = f"header.{encoded}.signature"
+                break
+        else:
+            self.fail("could not construct a url-safe-charset payload")
+
+        decoded = fitbit_api.FitbitClient._jwt_expiry(token)
+
+        self.assertIsNotNone(decoded)
+        self.assertEqual(int(decoded.timestamp()), int(exp.timestamp()))
 
     def test_save_tokens_does_not_treat_leading_digits_as_backreferences(self):
         self.write_secrets("old-access", "old-refresh")
