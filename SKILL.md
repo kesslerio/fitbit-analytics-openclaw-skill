@@ -8,6 +8,8 @@ metadata: {"openclaw":{"requires":{"bins":["python3"],"env":["FITBIT_CLIENT_ID",
 
 ## Quick Start
 
+**Owned entrypoints:** `fitbit_briefing.py`, `fitbit_api.py`, and the `run-fitbit-report.sh` cron wrapper that calls `fitbit_briefing.py`.
+
 ```bash
 # Set Fitbit API credentials
 export FITBIT_CLIENT_ID="your_client_id"
