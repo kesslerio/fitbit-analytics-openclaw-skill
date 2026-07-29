@@ -38,6 +38,8 @@ class FitbitClient:
         self._access_token = access_token or self._load_env_from_secrets("FITBIT_ACCESS_TOKEN")
         self._refresh_token = refresh_token or self._load_env_from_secrets("FITBIT_REFRESH_TOKEN")
         self._token_expires_at = None
+        if access_token is None and refresh_token is None:
+            self._prefer_newer_cached_tokens()
         self._load_token_expiry()
 
         if not self._access_token:
@@ -47,6 +49,50 @@ class FitbitClient:
             "Authorization": f"Bearer {self._access_token}",
             "Content-Type": "application/json"
         }
+
+    @staticmethod
+    def _jwt_expiry(token):
+        """Return a token's JWT expiry, if it has one."""
+        if not token:
+            return None
+        try:
+            payload = token.split('.')[1]
+            padding = 4 - len(payload) % 4
+            if padding != 4:
+                payload += '=' * padding
+            data = json.loads(base64.b64decode(payload))
+            exp = data.get("exp")
+            return datetime.fromtimestamp(exp) if exp else None
+        except (IndexError, json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    def _prefer_newer_cached_tokens(self):
+        """Use a rotated cache pair when it is newer than the source environment."""
+        if not TOKEN_CACHE_PATH.exists():
+            return
+        try:
+            data = json.loads(TOKEN_CACHE_PATH.read_text())
+            cached_access = data.get("access_token")
+            cached_refresh = data.get("refresh_token")
+            cached_expiry_raw = data.get("expires_at")
+            cached_expiry = (
+                datetime.fromisoformat(cached_expiry_raw)
+                if cached_expiry_raw
+                else None
+            )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return
+
+        if not cached_access or not cached_refresh:
+            return
+
+        env_expiry = self._jwt_expiry(self._access_token)
+        if env_expiry and cached_expiry and env_expiry >= cached_expiry:
+            return
+
+        self._access_token = cached_access
+        self._refresh_token = cached_refresh
+        self._token_expires_at = cached_expiry
 
     def _load_env_from_secrets(self, key):
         """Load env var from secrets.conf if not already set"""
@@ -64,10 +110,10 @@ class FitbitClient:
             try:
                 data = json.loads(TOKEN_CACHE_PATH.read_text())
                 expires_at = data.get("expires_at")
-                if expires_at:
+                if expires_at and data.get("access_token") == self._access_token:
                     self._token_expires_at = datetime.fromisoformat(expires_at)
                     return
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 pass
 
         # Fallback: decode from JWT
@@ -76,17 +122,7 @@ class FitbitClient:
 
     def _decode_jwt_expiry(self):
         """Decode access token JWT to get expiry timestamp"""
-        try:
-            payload = self._access_token.split('.')[1]
-            padding = 4 - len(payload) % 4
-            if padding != 4:
-                payload += '=' * padding
-            data = json.loads(base64.b64decode(payload))
-            exp = data.get("exp")
-            if exp:
-                self._token_expires_at = datetime.fromtimestamp(exp)
-        except (IndexError, json.JSONDecodeError, TypeError):
-            self._token_expires_at = None
+        self._token_expires_at = self._jwt_expiry(self._access_token)
 
     def _should_refresh(self):
         """Check if token should be refreshed"""
@@ -112,7 +148,11 @@ class FitbitClient:
                 if f'{key}="' in content:
                     import re
                     pattern = rf'({key}=")([^"]*)(")'
-                    content = re.sub(pattern, rf'\1{value}\3', content)
+                    content = re.sub(
+                        pattern,
+                        lambda match: f"{match.group(1)}{value}{match.group(3)}",
+                        content,
+                    )
                 else:
                     content += f'\n{key}="{value}"'
             SECRETS_PATH.write_text(content)
